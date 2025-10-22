@@ -1,11 +1,9 @@
 import os
 import logging
+import json
+from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from dotenv import load_dotenv
-
-# get env variables
-load_dotenv() 
 
 # Enable logging
 logging.basicConfig(
@@ -15,8 +13,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-BOT_TOKEN = os.getenv('BOT_TOKEN')  # Get from environment variable
-STAFF_GROUP_ID = os.getenv('STAFF_GROUP_ID')  # Your staff group chat ID
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+STAFF_GROUP_ID = os.getenv('STAFF_GROUP_ID')
+
+# Data file for persistence
+DATA_FILE = Path('user_orders.json')
 
 # Menu data - easily update between events
 MENU = {
@@ -36,21 +37,44 @@ MENU = {
     }
 }
 
-# Store user orders in memory (for production, use a database)
-user_orders = {}
+def load_orders():
+    """Load orders from file"""
+    if DATA_FILE.exists():
+        try:
+            with open(DATA_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading orders: {e}")
+            return {}
+    return {}
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send welcome message and main menu"""
-    user_id = update.effective_user.id
-    user_name = update.effective_user.first_name
-    
-    # Initialize user order tracking
+def save_orders(orders):
+    """Save orders to file"""
+    try:
+        with open(DATA_FILE, 'w') as f:
+            json.dump(orders, f)
+    except Exception as e:
+        logger.error(f"Error saving orders: {e}")
+
+# Load existing orders on startup
+user_orders = load_orders()
+
+def ensure_user_exists(user_id, user_name):
+    """Make sure user is initialized"""
     if user_id not in user_orders:
         user_orders[user_id] = {
             'name': user_name,
             'orders': [],
             'total': 0.00
         }
+        save_orders(user_orders)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send welcome message and main menu"""
+    user_id = str(update.effective_user.id)
+    user_name = update.effective_user.first_name
+    
+    ensure_user_exists(user_id, user_name)
     
     keyboard = [
         [InlineKeyboardButton("🍹 Cocktails", callback_data='menu_cocktails')],
@@ -70,6 +94,11 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show menu category"""
     query = update.callback_query
     await query.answer()
+    
+    # Ensure user exists
+    user_id = str(update.effective_user.id)
+    user_name = update.effective_user.first_name
+    ensure_user_exists(user_id, user_name)
     
     category = query.data.split('_')[1]
     
@@ -96,18 +125,22 @@ async def add_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("Added to cart! ✅")
     
+    user_id = str(update.effective_user.id)
+    user_name = update.effective_user.first_name
+    ensure_user_exists(user_id, user_name)
+    
     parts = query.data.split('_', 2)
     category = parts[1]
     item = parts[2]
     price = MENU[category][item]
     
-    user_id = update.effective_user.id
     user_orders[user_id]['orders'].append({
         'item': item,
         'price': price,
         'category': category
     })
     user_orders[user_id]['total'] += price
+    save_orders(user_orders)
     
     # Show updated menu
     await show_menu(update, context)
@@ -117,7 +150,10 @@ async def view_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    user_id = update.effective_user.id
+    user_id = str(update.effective_user.id)
+    user_name = update.effective_user.first_name
+    ensure_user_exists(user_id, user_name)
+    
     orders = user_orders.get(user_id, {}).get('orders', [])
     
     if not orders:
@@ -150,7 +186,7 @@ async def submit_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    user_id = update.effective_user.id
+    user_id = str(update.effective_user.id)
     user_name = user_orders[user_id]['name']
     orders = user_orders[user_id]['orders']
     
@@ -191,6 +227,7 @@ async def submit_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Clear user's cart but keep running tab
     user_orders[user_id]['orders'] = []
+    save_orders(user_orders)
     
     # Confirm to user
     keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data='back_main')]]
@@ -207,7 +244,10 @@ async def view_tab(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    user_id = update.effective_user.id
+    user_id = str(update.effective_user.id)
+    user_name = update.effective_user.first_name
+    ensure_user_exists(user_id, user_name)
+    
     total = user_orders.get(user_id, {}).get('total', 0.00)
     
     tab_text = f"💰 Your Tab Tonight\n\n"
@@ -224,12 +264,13 @@ async def clear_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("Cart cleared! 🗑️")
     
-    user_id = update.effective_user.id
+    user_id = str(update.effective_user.id)
     if user_id in user_orders:
         # Remove cart items from total
         cart_total = sum(order['price'] for order in user_orders[user_id]['orders'])
         user_orders[user_id]['total'] -= cart_total
         user_orders[user_id]['orders'] = []
+        save_orders(user_orders)
     
     keyboard = [[InlineKeyboardButton("⬅️ Back to Menu", callback_data='back_main')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -244,6 +285,10 @@ async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
+    user_id = str(update.effective_user.id)
+    user_name = update.effective_user.first_name
+    ensure_user_exists(user_id, user_name)
+    
     keyboard = [
         [InlineKeyboardButton("🍹 Cocktails", callback_data='menu_cocktails')],
         [InlineKeyboardButton("🍤 Tapas", callback_data='menu_tapas')],
@@ -256,6 +301,13 @@ async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "What would you like to order?",
         reply_markup=reply_markup
     )
+
+async def reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reset all tabs - staff only command"""
+    global user_orders
+    user_orders = {}
+    save_orders(user_orders)
+    await update.message.reply_text("✅ All tabs have been reset!")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route button callbacks"""
@@ -283,6 +335,7 @@ def main():
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("reset", reset_all))
     application.add_handler(CallbackQueryHandler(button_handler))
     
     # Start the bot
