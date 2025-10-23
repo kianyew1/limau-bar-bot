@@ -4,6 +4,11 @@ import json
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from menu import MENU
+
+#for local
+from dotenv import load_dotenv
+load_dotenv()
 
 # Enable logging
 logging.basicConfig(
@@ -18,24 +23,6 @@ STAFF_GROUP_ID = os.getenv('STAFF_GROUP_ID')
 
 # Data file for persistence
 DATA_FILE = Path('user_orders.json')
-
-# Menu data - easily update between events
-MENU = {
-    'cocktails': {
-        'Margarita': 12.00,
-        'Mojito': 11.00,
-        'Old Fashioned': 14.00,
-        'Negroni': 13.00,
-        'Espresso Martini': 13.00,
-    },
-    'tapas': {
-        'Patatas Bravas': 8.00,
-        'Gambas al Ajillo': 12.00,
-        'Croquetas': 9.00,
-        'Jamón Ibérico': 15.00,
-        'Pan con Tomate': 6.00,
-    }
-}
 
 def load_orders():
     """Load orders from file"""
@@ -64,122 +51,176 @@ def ensure_user_exists(user_id, user_name):
     if user_id not in user_orders:
         user_orders[user_id] = {
             'name': user_name,
-            'orders': [],
-            'total': 0.00
+            'cart': [],  # Current cart items (not yet submitted)
+            'tab': 0.00   # Running tab of submitted orders
         }
         save_orders(user_orders)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send welcome message and main menu"""
+    """Send welcome message and regional menu"""
     user_id = str(update.effective_user.id)
     user_name = update.effective_user.first_name
     
     ensure_user_exists(user_id, user_name)
     
     keyboard = [
-        [InlineKeyboardButton("🍹 Cocktails", callback_data='menu_cocktails')],
-        [InlineKeyboardButton("🍤 Tapas", callback_data='menu_tapas')],
-        [InlineKeyboardButton("🛒 View Cart", callback_data='view_cart')],
+        [InlineKeyboardButton("🌮 Latin America", callback_data='region_latin')],
+        [InlineKeyboardButton("🍜 Southeast Asia", callback_data='region_sea')],
+        [InlineKeyboardButton("🦘 Oceania", callback_data='region_oceania')],
         [InlineKeyboardButton("💰 My Tab", callback_data='view_tab')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
         f"Hey {user_name}! 👋\n\n"
-        "Welcome to the bar! What would you like to order?",
+        "Welcome to our three-region culinary journey!\n"
+        "Select a region to explore:",
         reply_markup=reply_markup
     )
 
-async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show menu category"""
+async def show_region_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, region: str = None):
+    """Show region menu with current cart"""
     query = update.callback_query
-    await query.answer()
     
-    # Ensure user exists
     user_id = str(update.effective_user.id)
     user_name = update.effective_user.first_name
     ensure_user_exists(user_id, user_name)
     
-    category = query.data.split('_')[1]
+    # Get region from parameter or callback data
+    if region is None:
+        region = query.data.split('_')[1]
     
+    # Get region details
+    region_emojis = {
+        'latin': '🌮',
+        'sea': '🍜',
+        'oceania': '🦘'
+    }
+    region_names = {
+        'latin': 'Latin America',
+        'sea': 'Southeast Asia',
+        'oceania': 'Oceania'
+    }
+    
+    # Get current cart
+    cart = user_orders[user_id]['cart']
+    
+    # Build message text
+    message_text = f"{region_emojis[region]} {region_names[region]}\n"
+    message_text += "━━━━━━━━━━━━━━\n\n"
+    
+    if cart:
+        message_text += "🛒 Your Current Cart:\n"
+        for idx, order in enumerate(cart):
+            message_text += f"{idx + 1}. {order['item']} - ${order['price']:.2f}\n"
+        
+        subtotal = sum(order['price'] for order in cart)
+        message_text += f"\n💵 Cart Subtotal: ${subtotal:.2f}\n"
+        message_text += "━━━━━━━━━━━━━━\n\n"
+    
+    message_text += "Select items to add to your cart:"
+    
+    # Build menu keyboard
     keyboard = []
-    for item, price in MENU[category].items():
+    for item, price in MENU[region].items():
         keyboard.append([
             InlineKeyboardButton(
                 f"{item} - ${price:.2f}", 
-                callback_data=f'add_{category}_{item}'
+                callback_data=f'add_{region}_{item}'
             )
         ])
-    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data='back_main')])
+    
+    # Add action buttons
+    if cart:
+        keyboard.append([
+            InlineKeyboardButton("➖ Remove Item", callback_data=f'remove_menu_{region}'),
+            InlineKeyboardButton("🗑️ Clear Cart", callback_data=f'clear_{region}')
+        ])
+        keyboard.append([InlineKeyboardButton("✅ Submit Order", callback_data='submit_order')])
+    
+    keyboard.append([InlineKeyboardButton("⬅️ Back to Regions", callback_data='back_main')])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    title = "🍹 Cocktails" if category == 'cocktails' else "🍤 Tapas"
-    await query.edit_message_text(
-        f"{title}\n\nSelect an item to add to your order:",
-        reply_markup=reply_markup
-    )
+    await query.edit_message_text(message_text, reply_markup=reply_markup)
 
 async def add_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add item to user's cart"""
+    """Add item to user's cart and refresh menu"""
     query = update.callback_query
-    await query.answer("Added to cart! ✅")
+    await query.answer("Added! ✅")
     
     user_id = str(update.effective_user.id)
     user_name = update.effective_user.first_name
     ensure_user_exists(user_id, user_name)
     
     parts = query.data.split('_', 2)
-    category = parts[1]
+    region = parts[1]
     item = parts[2]
-    price = MENU[category][item]
+    price = MENU[region][item]
     
-    user_orders[user_id]['orders'].append({
+    user_orders[user_id]['cart'].append({
         'item': item,
         'price': price,
-        'category': category
+        'region': region
     })
-    user_orders[user_id]['total'] += price
     save_orders(user_orders)
     
-    # Show updated menu
-    await show_menu(update, context)
+    # Refresh the menu with updated cart
+    await show_region_menu(update, context, region=region)
 
-async def view_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show current cart"""
+async def show_remove_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show menu to remove items from cart"""
     query = update.callback_query
     await query.answer()
     
     user_id = str(update.effective_user.id)
-    user_name = update.effective_user.first_name
-    ensure_user_exists(user_id, user_name)
+    cart = user_orders[user_id]['cart']
     
-    orders = user_orders.get(user_id, {}).get('orders', [])
-    
-    if not orders:
-        keyboard = [[InlineKeyboardButton("⬅️ Back to Menu", callback_data='back_main')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            "Your cart is empty! 🛒",
-            reply_markup=reply_markup
-        )
+    if not cart:
+        await query.answer("Cart is empty!", show_alert=True)
         return
     
-    cart_text = "🛒 Your Cart:\n\n"
-    for order in orders:
-        cart_text += f"• {order['item']} - ${order['price']:.2f}\n"
+    # Get region from callback data
+    region = query.data.split('_')[2]
     
-    total = sum(order['price'] for order in orders)
-    cart_text += f"\n💵 Subtotal: ${total:.2f}"
+    # Build message
+    message_text = "🛒 Select item to remove:\n\n"
+    for idx, order in enumerate(cart):
+        message_text += f"{idx + 1}. {order['item']} - ${order['price']:.2f}\n"
     
-    keyboard = [
-        [InlineKeyboardButton("✅ Submit Order", callback_data='submit_order')],
-        [InlineKeyboardButton("🗑️ Clear Cart", callback_data='clear_cart')],
-        [InlineKeyboardButton("⬅️ Back to Menu", callback_data='back_main')],
-    ]
+    # Build keyboard with remove buttons
+    keyboard = []
+    for idx, order in enumerate(cart):
+        keyboard.append([
+            InlineKeyboardButton(
+                f"❌ Remove: {order['item']}", 
+                callback_data=f'removeitem_{region}_{idx}'
+            )
+        ])
+    
+    keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data=f'region_{region}')])
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(message_text, reply_markup=reply_markup)
+
+async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove specific item from cart"""
+    query = update.callback_query
+    await query.answer("Removed! ❌")
     
-    await query.edit_message_text(cart_text, reply_markup=reply_markup)
+    user_id = str(update.effective_user.id)
+    
+    parts = query.data.split('_')
+    region = parts[1]
+    item_idx = int(parts[2])
+    
+    # Remove item from cart
+    if item_idx < len(user_orders[user_id]['cart']):
+        user_orders[user_id]['cart'].pop(item_idx)
+        save_orders(user_orders)
+    
+    # Go back to region menu
+    await show_region_menu(update, context, region=region)
 
 async def submit_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Submit order and send ticket to staff"""
@@ -188,11 +229,16 @@ async def submit_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_id = str(update.effective_user.id)
     user_name = user_orders[user_id]['name']
-    orders = user_orders[user_id]['orders']
+    cart = user_orders[user_id]['cart']
     
-    if not orders:
-        await query.edit_message_text("Your cart is empty!")
+    if not cart:
+        await query.answer("Your cart is empty!", show_alert=True)
         return
+    
+    # Group orders by region
+    latin_orders = [o for o in cart if o['region'] == 'latin']
+    sea_orders = [o for o in cart if o['region'] == 'sea']
+    oceania_orders = [o for o in cart if o['region'] == 'oceania']
     
     # Create order ticket
     ticket = f"🎫 NEW ORDER\n"
@@ -200,24 +246,27 @@ async def submit_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ticket += f"👤 Customer: {user_name}\n"
     ticket += f"🆔 ID: {user_id}\n\n"
     
-    cocktails = [o for o in orders if o['category'] == 'cocktails']
-    tapas = [o for o in orders if o['category'] == 'tapas']
-    
-    if cocktails:
-        ticket += "🍹 COCKTAILS:\n"
-        for item in cocktails:
+    if latin_orders:
+        ticket += "🌮 LATIN AMERICA:\n"
+        for item in latin_orders:
             ticket += f"  • {item['item']}\n"
         ticket += "\n"
     
-    if tapas:
-        ticket += "🍤 TAPAS:\n"
-        for item in tapas:
+    if sea_orders:
+        ticket += "🍜 SOUTHEAST ASIA:\n"
+        for item in sea_orders:
             ticket += f"  • {item['item']}\n"
         ticket += "\n"
     
-    total = sum(order['price'] for order in orders)
+    if oceania_orders:
+        ticket += "🦘 OCEANIA:\n"
+        for item in oceania_orders:
+            ticket += f"  • {item['item']}\n"
+        ticket += "\n"
+    
+    order_total = sum(order['price'] for order in cart)
     ticket += f"━━━━━━━━━━━━━━\n"
-    ticket += f"💵 Order Total: ${total:.2f}"
+    ticket += f"💵 Order Total: ${order_total:.2f}"
     
     # Send to staff group
     try:
@@ -225,12 +274,13 @@ async def submit_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Failed to send to staff group: {e}")
     
-    # Clear user's cart but keep running tab
-    user_orders[user_id]['orders'] = []
+    # Add cart total to running tab and clear cart
+    user_orders[user_id]['tab'] += order_total
+    user_orders[user_id]['cart'] = []
     save_orders(user_orders)
     
     # Confirm to user
-    keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data='back_main')]]
+    keyboard = [[InlineKeyboardButton("🏠 Back to Regions", callback_data='back_main')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.edit_message_text(
@@ -248,13 +298,14 @@ async def view_tab(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.effective_user.first_name
     ensure_user_exists(user_id, user_name)
     
-    total = user_orders.get(user_id, {}).get('total', 0.00)
+    tab = user_orders.get(user_id, {}).get('tab', 0.00)
     
     tab_text = f"💰 Your Tab Tonight\n\n"
-    tab_text += f"Total: ${total:.2f}\n\n"
+    tab_text += f"Total: ${tab:.2f}\n\n"
+    tab_text += "This shows only your submitted orders.\n"
     tab_text += "Pay at the end of the night! 🎊"
     
-    keyboard = [[InlineKeyboardButton("⬅️ Back to Menu", callback_data='back_main')]]
+    keyboard = [[InlineKeyboardButton("⬅️ Back to Regions", callback_data='back_main')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.edit_message_text(tab_text, reply_markup=reply_markup)
@@ -265,20 +316,16 @@ async def clear_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("Cart cleared! 🗑️")
     
     user_id = str(update.effective_user.id)
-    if user_id in user_orders:
-        # Remove cart items from total
-        cart_total = sum(order['price'] for order in user_orders[user_id]['orders'])
-        user_orders[user_id]['total'] -= cart_total
-        user_orders[user_id]['orders'] = []
-        save_orders(user_orders)
     
-    keyboard = [[InlineKeyboardButton("⬅️ Back to Menu", callback_data='back_main')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    # Get region from callback data
+    region = query.data.split('_')[1]
     
-    await query.edit_message_text(
-        "Cart cleared! 🗑️",
-        reply_markup=reply_markup
-    )
+    # Clear cart
+    user_orders[user_id]['cart'] = []
+    save_orders(user_orders)
+    
+    # Return to the same region menu
+    await show_region_menu(update, context, region=region)
 
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Return to main menu"""
@@ -290,15 +337,15 @@ async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user_exists(user_id, user_name)
     
     keyboard = [
-        [InlineKeyboardButton("🍹 Cocktails", callback_data='menu_cocktails')],
-        [InlineKeyboardButton("🍤 Tapas", callback_data='menu_tapas')],
-        [InlineKeyboardButton("🛒 View Cart", callback_data='view_cart')],
+        [InlineKeyboardButton("🌮 Latin America", callback_data='region_latin')],
+        [InlineKeyboardButton("🍜 Southeast Asia", callback_data='region_sea')],
+        [InlineKeyboardButton("🦘 Oceania", callback_data='region_oceania')],
         [InlineKeyboardButton("💰 My Tab", callback_data='view_tab')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.edit_message_text(
-        "What would you like to order?",
+        "Select a region to explore:",
         reply_markup=reply_markup
     )
 
@@ -313,18 +360,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route button callbacks"""
     query = update.callback_query
     
-    if query.data.startswith('menu_'):
-        await show_menu(update, context)
+    if query.data.startswith('region_'):
+        await show_region_menu(update, context)
     elif query.data.startswith('add_'):
         await add_item(update, context)
-    elif query.data == 'view_cart':
-        await view_cart(update, context)
+    elif query.data.startswith('remove_menu_'):
+        await show_remove_menu(update, context)
+    elif query.data.startswith('removeitem_'):
+        await remove_item(update, context)
+    elif query.data.startswith('clear_'):
+        await clear_cart(update, context)
     elif query.data == 'submit_order':
         await submit_order(update, context)
     elif query.data == 'view_tab':
         await view_tab(update, context)
-    elif query.data == 'clear_cart':
-        await clear_cart(update, context)
     elif query.data == 'back_main':
         await back_main(update, context)
 
