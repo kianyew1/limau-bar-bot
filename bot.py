@@ -1,7 +1,9 @@
 import os
 import logging
 import json
+import csv
 from pathlib import Path
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from menu import MENU
@@ -20,6 +22,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 STAFF_GROUP_ID = os.getenv('STAFF_GROUP_ID')
+ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')  # Add this to your .env file
 
 # Data file for persistence
 DATA_FILE = Path('user_orders.json')
@@ -29,7 +32,13 @@ def load_orders():
     if DATA_FILE.exists():
         try:
             with open(DATA_FILE, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                # Migrate old data structure to new one
+                for user_id, user_data in data.items():
+                    # Ensure order_history exists
+                    if 'order_history' not in user_data:
+                        data[user_id]['order_history'] = []
+                return data
         except Exception as e:
             logger.error(f"Error loading orders: {e}")
             return {}
@@ -39,7 +48,7 @@ def save_orders(orders):
     """Save orders to file"""
     try:
         with open(DATA_FILE, 'w') as f:
-            json.dump(orders, f)
+            json.dump(orders, f, indent=2)
     except Exception as e:
         logger.error(f"Error saving orders: {e}")
 
@@ -52,8 +61,18 @@ def ensure_user_exists(user_id, user_name):
         user_orders[user_id] = {
             'name': user_name,
             'cart': [],  # Current cart items (not yet submitted)
-            'tab': 0.00   # Running tab of submitted orders
+            'tab': 0.00,   # Running tab of submitted orders
+            'order_history': []  # List of all ordered items
         }
+        save_orders(user_orders)
+    else:
+        # Ensure the user has the new structure
+        if 'cart' not in user_orders[user_id]:
+            user_orders[user_id]['cart'] = []
+        if 'tab' not in user_orders[user_id]:
+            user_orders[user_id]['tab'] = 0.00
+        if 'order_history' not in user_orders[user_id]:
+            user_orders[user_id]['order_history'] = []
         save_orders(user_orders)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -274,6 +293,16 @@ async def submit_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Failed to send to staff group: {e}")
     
+    # Add items to order history with timestamp
+    timestamp = datetime.now().isoformat()
+    for item in cart:
+        user_orders[user_id]['order_history'].append({
+            'item': item['item'],
+            'price': item['price'],
+            'region': item['region'],
+            'timestamp': timestamp
+        })
+    
     # Add cart total to running tab and clear cart
     user_orders[user_id]['tab'] += order_total
     user_orders[user_id]['cart'] = []
@@ -299,10 +328,17 @@ async def view_tab(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user_exists(user_id, user_name)
     
     tab = user_orders.get(user_id, {}).get('tab', 0.00)
+    order_history = user_orders.get(user_id, {}).get('order_history', [])
     
     tab_text = f"💰 Your Tab Tonight\n\n"
+    
+    if order_history:
+        tab_text += "📝 Items Ordered:\n"
+        for item in order_history:
+            tab_text += f"  • {item['item']} - ${item['price']:.2f}\n"
+        tab_text += "\n"
+    
     tab_text += f"Total: ${tab:.2f}\n\n"
-    tab_text += "This shows only your submitted orders.\n"
     tab_text += "Pay at the end of the night! 🎊"
     
     keyboard = [[InlineKeyboardButton("⬅️ Back to Regions", callback_data='back_main')]]
@@ -351,10 +387,128 @@ async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reset all tabs - staff only command"""
+    user_id = str(update.effective_user.id)
+    
+    # Check if user is admin
+    if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ This command is only available to staff.")
+        return
+    
     global user_orders
     user_orders = {}
     save_orders(user_orders)
     await update.message.reply_text("✅ All tabs have been reset!")
+
+async def export_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Export all orders and tabs - staff only command"""
+    user_id = str(update.effective_user.id)
+    
+    # Check if user is admin
+    if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ This command is only available to staff.")
+        return
+    
+    if not user_orders:
+        await update.message.reply_text("No orders to export!")
+        return
+    
+    # Create detailed export message
+    export_text = "📊 END OF NIGHT SUMMARY\n"
+    export_text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    total_revenue = 0.00
+    
+    for user_id, user_data in user_orders.items():
+        name = user_data['name']
+        tab = user_data['tab']
+        order_history = user_data.get('order_history', [])
+        total_revenue += tab
+        
+        export_text += f"👤 {name} (ID: {user_id})\n"
+        if order_history:
+            export_text += "Items ordered:\n"
+            for item in order_history:
+                export_text += f"  • {item['item']} - ${item['price']:.2f}\n"
+        export_text += f"💵 Total: ${tab:.2f}\n"
+        export_text += "─────────────────\n"
+    
+    export_text += f"\n💰 TOTAL REVENUE: ${total_revenue:.2f}\n"
+    export_text += f"👥 Total Customers: {len(user_orders)}\n"
+    
+    # Send the summary (split if too long)
+    if len(export_text) > 4096:
+        # Split into chunks
+        chunks = [export_text[i:i+4096] for i in range(0, len(export_text), 4096)]
+        for chunk in chunks:
+            await update.message.reply_text(chunk)
+    else:
+        await update.message.reply_text(export_text)
+    
+    # Create CSV file
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    csv_filename = f"orders_export_{timestamp}.csv"
+    csv_path = Path(csv_filename)
+    
+    try:
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['User ID', 'Name', 'Item', 'Price', 'Region', 'Timestamp', 'User Total']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            writer.writeheader()
+            for user_id, user_data in user_orders.items():
+                name = user_data['name']
+                tab = user_data['tab']
+                order_history = user_data.get('order_history', [])
+                
+                if order_history:
+                    for item in order_history:
+                        writer.writerow({
+                            'User ID': user_id,
+                            'Name': name,
+                            'Item': item['item'],
+                            'Price': item['price'],
+                            'Region': item['region'],
+                            'Timestamp': item.get('timestamp', ''),
+                            'User Total': tab
+                        })
+                else:
+                    # Write user with no orders
+                    writer.writerow({
+                        'User ID': user_id,
+                        'Name': name,
+                        'Item': '',
+                        'Price': 0.00,
+                        'Region': '',
+                        'Timestamp': '',
+                        'User Total': tab
+                    })
+        
+        # Send CSV file
+        with open(csv_path, 'rb') as f:
+            await update.message.reply_document(
+                document=f,
+                filename=csv_filename,
+                caption="📊 Orders export (CSV)"
+            )
+        
+        # Clean up CSV file
+        csv_path.unlink()
+        
+    except Exception as e:
+        logger.error(f"Failed to create/send CSV: {e}")
+        await update.message.reply_text(f"Error creating CSV: {e}")
+    
+    # Send the JSON file
+    try:
+        with open(DATA_FILE, 'rb') as f:
+            await update.message.reply_document(
+                document=f,
+                filename=f"orders_export_{timestamp}.json",
+                caption="📁 Full order data (JSON)"
+            )
+    except Exception as e:
+        logger.error(f"Failed to send JSON file: {e}")
+        await update.message.reply_text(f"Error sending JSON file: {e}")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route button callbacks"""
@@ -385,6 +539,7 @@ def main():
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("reset", reset_all))
+    application.add_handler(CommandHandler("export", export_orders))
     application.add_handler(CallbackQueryHandler(button_handler))
     
     # Start the bot
