@@ -541,7 +541,7 @@ def main():
     application.add_handler(CommandHandler("reset", reset_all))
     application.add_handler(CommandHandler("export", export_orders))
     application.add_handler(CallbackQueryHandler(button_handler))
-    
+
     # Start the bot
     logger.info("Bot starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
